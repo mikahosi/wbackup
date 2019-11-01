@@ -9,11 +9,12 @@ wbackup
 * remove archive flags.
 
 ## duplicate check database
-32bit checksum
-SHA-256 hash
-binary data stream id
+* 32bit checksum
+* SHA-256 hash
+* backup count (64bit)
+* binary stream id (64bit)
 
 ## binary data stream
-binary data stream id
-32bit HEX
-FFFF-FFFF-FFFF-FFFF-FFFFFFFF.gzip
+* backup count (64bit)
+* binary stream id (64bit)
+* 32bit HEX
