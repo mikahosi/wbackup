@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "wbackup": {
+      "commandName": "Project",
+      "commandLineArgs": "-srce \"D:\\win32_11gR2_client\" -dest \"C:\\CLWORK\\archive\""
+    }
+  }
+}
