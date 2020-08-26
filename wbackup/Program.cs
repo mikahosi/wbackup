@@ -6,7 +6,8 @@ using System.IO.Enumeration;
 using System.Linq;
 using System.Threading;
 using System.Security.Cryptography.X509Certificates;
-using ICSharpCode.SharpZipLib.Zip;
+using ICSharpCode.SharpZipLib.GZip;
+using ICSharpCode.SharpZipLib.Tar;
 using System.Threading.Tasks;
 
 namespace wbackup
@@ -38,117 +39,109 @@ namespace wbackup
 
             sw.Start();
 
-            Parallel.For(0, 4, i => 
+            Parallel.For(0, 1, i =>
             {
-                var nameTrans = new ZipNameTransform();
-
-                string zipFileName = param.destinationDir + "-" + postFixString + "-" + i.ToString("00") + ".zip";
-                var fos = new FileStream(zipFileName, FileMode.Create, FileAccess.Write);
-                ZipOutputStream zos = new ZipOutputStream(fos);
-                zos.SetLevel(4);
-                zos.UseZip64 = UseZip64.On;
-
-                int buffSize = 65536;
-                byte[][] readBuffer = new byte[2][];
-                readBuffer[0] = new byte[buffSize];
-                readBuffer[1] = new byte[buffSize];
-
-                while (srceFilesQueue.TryDequeue(out string srceFileName))
+                // アーカイブ先ファイルのインスタンスを作成
+                string zipFileName = param.destinationDir + "-" + postFixString + "-" + i.ToString("00") + ".tar.gz";
+                using (var fos = new FileStream(zipFileName, FileMode.Create, FileAccess.Write))
+                using (GZipOutputStream bzo = new GZipOutputStream(fos))
+                using (TarOutputStream zos = new TarOutputStream(bzo))
                 {
-                    try
+                    bzo.IsStreamOwner = false;
+                    bzo.SetLevel(9);
+
+                    int buffSelect = 0;
+                    int buffSize = zos.RecordSize;
+                    byte[][] readBuffer = new byte[2][];
+                    readBuffer[0] = new byte[buffSize];
+                    readBuffer[1] = new byte[buffSize];
+
+                    while (srceFilesQueue.TryDequeue(out string srceFileName))
                     {
-                        var attribute = File.GetAttributes(srceFileName);
-                        if (attribute.HasFlag(FileAttributes.Archive) || param.backupMode== BackupMopde.Full)
+                        try
                         {
-                            if (consoleLock.WaitOne())
+                            var attribute = File.GetAttributes(srceFileName);
+                            if (attribute.HasFlag(FileAttributes.Archive) || param.backupMode == BackupMopde.Full)
                             {
-                                Console.WriteLine("Archive, {0}", srceFileName);
-                                if (logws != null)
-                                    logws.WriteLine("Archive, {0}", srceFileName);
-                                consoleLock.ReleaseMutex();
-                            }
-
-                            FileInfo fi = new FileInfo(srceFileName);
-                            string f = nameTrans.TransformFile(srceFileName);
-                            ZipEntry zipEntry = new ZipEntry(f);
-                            zipEntry.DateTime = fi.LastWriteTime;
-                            zipEntry.ExternalFileAttributes = (int )fi.Attributes;
-                            zipEntry.Size = fi.Length;
-
-                            // 一部の拡張子について、圧縮対象から除外する
-                            int extPos = srceFileName.LastIndexOf('.');
-                            if (extPos > 0)
-                            {
-                                string extension = srceFileName.Substring(extPos).ToLower();
-                                foreach (var extMatch in storedTarget)
+                                if (consoleLock.WaitOne())
                                 {
-                                    if (extension == extMatch)
+                                    Console.WriteLine("Archive, {0}", srceFileName);
+                                    if (logws != null)
+                                        logws.WriteLine("Archive, {0}", srceFileName);
+                                    consoleLock.ReleaseMutex();
+                                }
+
+
+                                // バックアップ対象を出力先に転記する
+                                using (var fis = new FileStream(srceFileName, FileMode.Open, FileAccess.Read))
+                                {
+                                    // ZIPファイルヘッダ作成
+                                    TarEntry tarEntry = TarEntry.CreateEntryFromFile(srceFileName);
+                                    zos.PutNextEntry(tarEntry);
+
+                                    Task<int> readResult = fis.ReadAsync(readBuffer[buffSelect], 0, buffSize);
+                                    while (true)
                                     {
-                                        zipEntry.CompressionMethod = CompressionMethod.Stored;
-                                        break;
+                                        readResult.Wait();
+                                        int readSize = readResult.Result;
+                                        if (readSize <= 0)
+                                        {
+                                            break;
+                                        }
+
+                                        Task writeResult = zos.WriteAsync(readBuffer[buffSelect], 0, readSize);
+
+                                        buffSelect ^= 1;
+                                        readResult = fis.ReadAsync(readBuffer[buffSelect], 0, buffSize);
+
+                                        writeResult.Wait();
                                     }
+
+                                    zos.CloseEntry();
+                                }
+
+                                // アーカイブフラグを解除する
+                                if (param.backupMode == BackupMopde.Full || param.backupMode == BackupMopde.Differencial)
+                                {
+                                    File.SetAttributes(srceFileName, (attribute & (~FileAttributes.Archive)));
+                                }
+
+                                Interlocked.Increment(ref archiveFileCount);
+                            }
+                            else
+                            {
+                                // アーカイブフラグがないファイルをスキップする
+                                if (consoleLock.WaitOne())
+                                {
+                                    Console.WriteLine("Skip, {0}", srceFileName);
+                                    if (logws != null)
+                                        logws.WriteLine("Skip, {0}", srceFileName);
+                                    consoleLock.ReleaseMutex();
                                 }
                             }
-
-                            var fis = new FileStream(srceFileName, FileMode.Open, FileAccess.Read);
-                            zos.PutNextEntry(zipEntry);
-
-                            int buffSelect = 0;
-                            Task<int> len = fis.ReadAsync(readBuffer[buffSelect], 0, buffSize);
-                            while (true)
-                            {
-                                len.Wait();
-                                if (len.Result <= 0)
-                                    break;
-                                Task writeResult = zos.WriteAsync(readBuffer[buffSelect], 0, len.Result);
-
-                                buffSelect ^= 1;
-                                len = fis.ReadAsync(readBuffer[buffSelect], 0, buffSize);
-
-                                writeResult.Wait();
-                            }
-                            fis.Close();
-                            zos.Flush();
-
-                            if (param.backupMode == BackupMopde.Full || param.backupMode == BackupMopde.Differencial)
-                            {
-                                File.SetAttributes(srceFileName, (attribute & (~FileAttributes.Archive)));
-                            }
-
-                            Interlocked.Increment(ref archiveFileCount);
                         }
-                        else
+                        catch (Exception exp)
                         {
+                            srceFilesQueue.Enqueue(srceFileName);
+
+                            var curtExceptionCnt = Interlocked.Increment(ref exceptionCount);
+
                             if (consoleLock.WaitOne())
                             {
-                                Console.WriteLine("Skip, {0}", srceFileName);
+                                Console.WriteLine("Exception {0}, {1}", curtExceptionCnt, exp.ToString());
                                 if (logws != null)
-                                    logws.WriteLine("Skip, {0}", srceFileName);
+                                    logws.WriteLine("Exception {0}, {1}", curtExceptionCnt, exp.ToString());
                                 consoleLock.ReleaseMutex();
                             }
                         }
-                    }
-                    catch(Exception exp)
-                    {
-                        srceFilesQueue.Enqueue(srceFileName);
 
-                        var curtExceptionCnt = Interlocked.Increment(ref exceptionCount);
-
-                        if (consoleLock.WaitOne())
-                        {
-                            Console.WriteLine("Exception {0}, {1}", curtExceptionCnt, exp.ToString());
-                            if (logws != null)
-                                logws.WriteLine("Exception {0}, {1}", curtExceptionCnt, exp.ToString());
-                            consoleLock.ReleaseMutex();
-                        }
-
-                        if (curtExceptionCnt > param.maxRetryCount)
+                        if (exceptionCount > param.maxRetryCount)
                             break;
                     }
-                }
 
-                zos.Finish();
-                zos.Close();
+                    zos.Flush();
+                    zos.Close();
+                }
             });
 
             sw.Stop();
